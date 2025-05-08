@@ -1,118 +1,173 @@
-const http = require('http');
-const https = require('https');
-const { URL } = require('url'); // Standard URL parser
+const net = require('net');
 
-const PROXY_PORT = 8100; // 中转服务监听的端口
+const RELAY_LISTEN_PORT = 8100; // Node.js 中继服务监听的端口
+const CONNECTION_TIMEOUT = 15000; // 15秒连接超时
 
-const server = http.createServer((clientReq, clientRes) => {
-    // clientReq.url 会是像 "/https://target-site.com/path?query=value" 这样的形式
-    // 我们需要去掉第一个斜杠 "/" 来获取真正的目标 URL
-    const targetUrlString = clientReq.url.substring(1);
+const server = net.createServer((workerSocket) => {
+    console.log(`[RELAY] CF Worker connected from ${workerSocket.remoteAddress}:${workerSocket.remotePort}`);
+    workerSocket.setNoDelay(true);
 
-    if (!targetUrlString) {
-        console.log('[PROXY] 收到了空的目标 URL');
-        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
-        clientRes.end('Target URL is missing.');
-        return;
-    }
+    let targetHost = '';
+    let targetPort = 0;
+    let targetInfoReceived = false;
+    let upstreamSocket = null;
+    let initialDataBuffer = []; // Buffer for data received before target info
 
-    let targetUrl;
-    try {
-        targetUrl = new URL(targetUrlString);
-    } catch (e) {
-        console.error(`[PROXY] 无效的目标 URL: ${targetUrlString}. 错误: ${e.message}`);
-        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
-        clientRes.end(`Invalid target URL: ${targetUrlString}`);
-        return;
-    }
-
-    console.log(`[PROXY] CF Worker 请求: ${clientReq.method} ${clientReq.url}`);
-    console.log(`[PROXY] 转发到 -> ${targetUrl.href}`);
-
-    const options = {
-        method: clientReq.method,
-        headers: { ...clientReq.headers }, // 复制客户端请求的头部
-        hostname: targetUrl.hostname,
-        port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
-        path: `${targetUrl.pathname}${targetUrl.search}`, // 包含查询参数
-        agent: false, // 关键：为每个请求创建新代理，避免keep-alive问题和头部混乱
-        timeout: 30000, // 30秒超时
-    };
-
-    // 移除一些在 Node.js http.request 中不应该由我们手动设置的头部，
-    // 或者需要特殊处理的头部。Node 会自动处理 'host'。
-    // 'connection' 头部由 Node.js 管理。
-    delete options.headers.host; // Node.js 会根据 targetUrl.hostname 自动设置 Host 头部
-    // delete options.headers.connection; // 让 Node.js 处理 Connection 头部
-
-    const httpModule = targetUrl.protocol === 'https:' ? https : http;
-
-    const proxyReq = httpModule.request(options, (targetRes) => {
-        console.log(`[PROXY] 收到来自 ${targetUrl.href} 的响应: ${targetRes.statusCode}`);
-        // 将目标服务器的头部和状态码写回给原始客户端 (CF Worker)
-        // 注意：某些头部可能需要特殊处理或过滤 (例如与 hop-by-hop 相关的头部)
-        const responseHeaders = { ...targetRes.headers };
-        // 通常不应该转发 hop-by-hop 头部
-        delete responseHeaders['transfer-encoding'];
-        delete responseHeaders['connection'];
-        delete responseHeaders['keep-alive'];
-        delete responseHeaders['proxy-authenticate'];
-        delete responseHeaders['proxy-authorization'];
-        delete responseHeaders['te'];
-        delete responseHeaders['trailers'];
-        delete responseHeaders['upgrade'];
-
-
-        clientRes.writeHead(targetRes.statusCode, responseHeaders);
-        targetRes.pipe(clientRes, { end: true }); // 将目标服务器的响应体 pipe 给原始客户端
-    });
-
-    proxyReq.on('timeout', () => {
-        console.error(`[PROXY] 请求到 ${targetUrl.href} 超时`);
-        proxyReq.destroy(); // 销毁请求
-        if (!clientRes.headersSent) {
-            clientRes.writeHead(504, { 'Content-Type': 'text/plain' });
+    const connectTimeout = setTimeout(() => {
+        if (!targetInfoReceived || !upstreamSocket || !upstreamSocket.writable) {
+            console.log(`[RELAY] Timeout waiting for target info or upstream connection for ${workerSocket.remoteAddress}`);
+            workerSocket.destroy(new Error('Relay connection setup timeout'));
         }
-        clientRes.end('Gateway Timeout');
-    });
+    }, CONNECTION_TIMEOUT);
 
-    proxyReq.on('error', (e) => {
-        console.error(`[PROXY] 转发到 ${targetUrl.href} 出错: ${e.message}`);
-        if (!clientRes.headersSent) { // 确保只发送一次头部
-            clientRes.writeHead(502, { 'Content-Type': 'text/plain' });
+    workerSocket.on('data', async (data) => {
+        if (upstreamSocket && upstreamSocket.writable) {
+            // Target info already processed, forward data to upstream
+            if (!upstreamSocket.write(data)) {
+                workerSocket.pause();
+                upstreamSocket.once('drain', () => workerSocket.resume());
+            }
+            return;
         }
-        clientRes.end(`Bad Gateway: ${e.message}`);
-    });
+        
+        // Buffer initial data until target info is fully parsed or upstream is ready
+        initialDataBuffer.push(data);
 
-    // 将原始客户端 (CF Worker) 的请求体 pipe 给目标服务器的请求
-    // 只有在 GET/HEAD 等方法之外才有请求体
-    if (clientReq.method !== 'GET' && clientReq.method !== 'HEAD') {
-        clientReq.pipe(proxyReq, { end: true });
-    } else {
-        proxyReq.end(); // 对于 GET/HEAD 请求，没有请求体，直接结束请求
-    }
+        if (targetInfoReceived) { // Target info parsed, but upstream not ready yet. Keep buffering.
+            return;
+        }
 
-    // 如果客户端意外断开连接
-    clientReq.on('error', (err) => {
-        console.error(`[PROXY] 客户端请求错误: ${err.message}`);
-        proxyReq.destroy(); // 中断对目标服务器的请求
-    });
-    clientReq.on('close', () => {
-        if (!clientRes.writableEnded) { // 如果响应还没有结束
-            console.log('[PROXY] 客户端连接在响应完成前关闭');
-            proxyReq.destroy(); // 中断对目标服务器的请求
+        // Try to parse target info from the combined buffer
+        const combinedBuffer = Buffer.concat(initialDataBuffer);
+        let consumedBytes = 0;
+
+        try {
+            // Protocol: addressType (1 byte) | [addressLength (1 byte) if domain] | addressValue (var) | port (2 bytes BE)
+            if (combinedBuffer.length < 1) return; // Need at least addressType
+            const addressType = combinedBuffer.readUInt8(0);
+            consumedBytes = 1;
+
+            if (addressType === 1) { // IPv4
+                if (combinedBuffer.length < consumedBytes + 4 + 2) return; // IPv4 (4) + port (2)
+                targetHost = `${combinedBuffer.readUInt8(consumedBytes++)}.${combinedBuffer.readUInt8(consumedBytes++)}.${combinedBuffer.readUInt8(consumedBytes++)}.${combinedBuffer.readUInt8(consumedBytes++)}`;
+            } else if (addressType === 2) { // Domain name
+                if (combinedBuffer.length < consumedBytes + 1) return; // addressLength (1)
+                const addressLength = combinedBuffer.readUInt8(consumedBytes++);
+                if (combinedBuffer.length < consumedBytes + addressLength + 2) return; // domain (var) + port (2)
+                targetHost = combinedBuffer.toString('utf8', consumedBytes, consumedBytes + addressLength);
+                consumedBytes += addressLength;
+            } else if (addressType === 3) { // IPv6
+                if (combinedBuffer.length < consumedBytes + 16 + 2) return; // IPv6 (16) + port (2)
+                const ipv6Bytes = [];
+                for (let i = 0; i < 16; i += 2) {
+                    ipv6Bytes.push(combinedBuffer.readUInt16BE(consumedBytes + i).toString(16));
+                }
+                targetHost = ipv6Bytes.join(':');
+                consumedBytes += 16;
+            } else {
+                throw new Error(`Invalid addressType: ${addressType}`);
+            }
+
+            targetPort = combinedBuffer.readUInt16BE(consumedBytes);
+            consumedBytes += 2;
+            targetInfoReceived = true;
+            clearTimeout(connectTimeout); // Clear timeout once target info is received
+            console.log(`[RELAY] Received target from Worker: ${targetHost}:${targetPort}`);
+
+            // Extract any remaining data that was part of the VLESS payload
+            const remainingVlessData = combinedBuffer.slice(consumedBytes);
+            initialDataBuffer = [remainingVlessData]; // Save for sending after connection
+
+            // Now connect to the actual target
+            upstreamSocket = new net.Socket();
+            upstreamSocket.setNoDelay(true);
+
+            upstreamSocket.connect({ host: targetHost, port: targetPort }, () => {
+                console.log(`[RELAY] Connected to target: ${targetHost}:${targetPort}`);
+                workerSocket.write(Buffer.from([0])); // Send 0 (success) to Worker
+
+                // Send any buffered VLESS initial payload
+                if (initialDataBuffer.length > 0) {
+                    const headPayload = Buffer.concat(initialDataBuffer);
+                    if (headPayload.length > 0) {
+                        console.log(`[RELAY] Writing initial ${headPayload.length} bytes of VLESS data to target`);
+                        upstreamSocket.write(headPayload);
+                    }
+                    initialDataBuffer = []; // Clear buffer
+                }
+
+                // Start piping
+                workerSocket.pipe(upstreamSocket);
+                upstreamSocket.pipe(workerSocket);
+            });
+
+            upstreamSocket.on('error', (err) => {
+                console.error(`[RELAY] Upstream connection error to ${targetHost}:${targetPort}: ${err.message}`);
+                if (!workerSocket.destroyed) {
+                    workerSocket.write(Buffer.from([1])); // Send 1 (failure) to Worker
+                    workerSocket.destroy(err);
+                }
+                clearTimeout(connectTimeout);
+            });
+
+            upstreamSocket.on('close', () => {
+                console.log(`[RELAY] Upstream connection to ${targetHost}:${targetPort} closed.`);
+                if (!workerSocket.destroyed) workerSocket.destroy();
+                clearTimeout(connectTimeout);
+            });
+            upstreamSocket.on('timeout', () => {
+                console.error(`[RELAY] Upstream connection to ${targetHost}:${targetPort} timed out.`);
+                 if (!workerSocket.destroyed) {
+                    workerSocket.write(Buffer.from([1]));
+                    workerSocket.destroy(new Error('Upstream timeout'));
+                }
+                clearTimeout(connectTimeout);
+            });
+            upstreamSocket.setTimeout(CONNECTION_TIMEOUT);
+
+
+        } catch (e) {
+            if (e instanceof RangeError && e.message.includes('Index out of range')) {
+                // Not enough data yet to parse header, wait for more.
+                // initialDataBuffer already contains the partial data.
+                return;
+            }
+            console.error(`[RELAY] Error processing target info or connecting: ${e.message}`);
+            if (!workerSocket.destroyed) {
+                workerSocket.write(Buffer.from([1])); // Send 1 (failure)
+                workerSocket.destroy(e);
+            }
+            clearTimeout(connectTimeout);
         }
     });
+
+    workerSocket.on('error', (err) => {
+        console.error(`[RELAY] Worker socket error: ${err.message}`);
+        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
+        clearTimeout(connectTimeout);
+    });
+
+    workerSocket.on('close', () => {
+        console.log(`[RELAY] CF Worker connection closed.`);
+        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
+        clearTimeout(connectTimeout);
+    });
+
+    workerSocket.on('timeout', () => {
+        console.error(`[RELAY] Worker socket timed out before target info processed.`);
+        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
+        workerSocket.destroy(new Error('Worker socket timeout'));
+        clearTimeout(connectTimeout);
+    });
+    workerSocket.setTimeout(CONNECTION_TIMEOUT);
 
 
 });
 
-server.on('clientError', (err, socket) => {
-    console.error(`[PROXY] 客户端连接错误: ${err.message}`);
-    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+server.on('error', (err) => {
+    console.error(`[RELAY] Server error: ${err.message}`);
 });
 
-server.listen(PROXY_PORT, () => {
-    console.log(`[PROXY] 中转服务正在监听端口 ${PROXY_PORT}`);
-    console.log(`[PROXY] CF Worker 使用示例: fetch('http://<中转IP>:${PROXY_PORT}/https://目标网站.com/路径')`);
+server.listen(RELAY_LISTEN_PORT, () => {
+    console.log(`[RELAY] Node.js TCP Relay server listening on port ${RELAY_LISTEN_PORT}`);
 });
