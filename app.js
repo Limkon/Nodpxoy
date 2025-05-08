@@ -1,49 +1,69 @@
 const net = require('net');
 
 const RELAY_LISTEN_PORT = 8100; // Node.js 中继服务监听的端口
-const CONNECTION_TIMEOUT = 15000; // 15秒连接超时
+const CONNECTION_TIMEOUT = 15000; // 15秒连接超时 (连接到最终目标和Worker发送目标信息)
+const UPSTREAM_TIMEOUT = 30000; // 30秒上游数据传输超时
+
+console.log(`[RELAY] TCP Relay Server starting on port ${RELAY_LISTEN_PORT}`);
 
 const server = net.createServer((workerSocket) => {
     console.log(`[RELAY] CF Worker connected from ${workerSocket.remoteAddress}:${workerSocket.remotePort}`);
     workerSocket.setNoDelay(true);
+    workerSocket.setKeepAlive(true, 60000);
+
 
     let targetHost = '';
     let targetPort = 0;
     let targetInfoReceived = false;
     let upstreamSocket = null;
-    let initialDataBuffer = []; // Buffer for data received before target info
+    let initialDataBuffer = []; // 缓冲在目标信息完全解析前收到的数据
+    let connectTimer = null;
+    let handshakeCompleted = false; // 标记握手是否完成，包括收到relay status
 
-    const connectTimeout = setTimeout(() => {
-        if (!targetInfoReceived || !upstreamSocket || !upstreamSocket.writable) {
-            console.log(`[RELAY] Timeout waiting for target info or upstream connection for ${workerSocket.remoteAddress}`);
-            workerSocket.destroy(new Error('Relay connection setup timeout'));
+    const cleanup = (errorMessage) => {
+        if (connectTimer) clearTimeout(connectTimer);
+        if (!workerSocket.destroyed) {
+            if (errorMessage && !handshakeCompleted) { // 如果握手未完成且有错误，发送失败状态
+                 try { workerSocket.write(Buffer.from([1])); } catch (e) { /* ignore */ }
+            }
+            workerSocket.destroy(errorMessage ? new Error(errorMessage) : undefined);
         }
+        if (upstreamSocket && !upstreamSocket.destroyed) {
+            upstreamSocket.destroy();
+        }
+        console.log(`[RELAY] Cleaned up connection for ${workerSocket.remoteAddress}. ${errorMessage || ''}`);
+    };
+    
+    connectTimer = setTimeout(() => {
+        cleanup('Timeout waiting for target info or upstream connection');
     }, CONNECTION_TIMEOUT);
 
     workerSocket.on('data', async (data) => {
-        if (upstreamSocket && upstreamSocket.writable) {
-            // Target info already processed, forward data to upstream
+        if (handshakeCompleted && upstreamSocket && upstreamSocket.writable) {
+            // 目标信息已处理，上游连接已建立，直接转发数据
             if (!upstreamSocket.write(data)) {
                 workerSocket.pause();
-                upstreamSocket.once('drain', () => workerSocket.resume());
+                upstreamSocket.once('drain', () => {
+                    if (!workerSocket.destroyed) workerSocket.resume();
+                });
             }
             return;
         }
         
-        // Buffer initial data until target info is fully parsed or upstream is ready
         initialDataBuffer.push(data);
 
-        if (targetInfoReceived) { // Target info parsed, but upstream not ready yet. Keep buffering.
+        if (targetInfoReceived) { 
+            // 目标信息已解析，但可能上游连接还未就绪，或正在等待relay status回传后才算握手完成
+            // 数据将会在upstreamSocket连接成功并发送成功状态后，由该连接的回调处理
             return;
         }
 
-        // Try to parse target info from the combined buffer
         const combinedBuffer = Buffer.concat(initialDataBuffer);
         let consumedBytes = 0;
 
         try {
-            // Protocol: addressType (1 byte) | [addressLength (1 byte) if domain] | addressValue (var) | port (2 bytes BE)
-            if (combinedBuffer.length < 1) return; // Need at least addressType
+            // 协议: addressType (1 byte) | [addressLength (1 byte) if domain] | addressValue (var) | port (2 bytes BE)
+            if (combinedBuffer.length < 1) return; // 至少需要 addressType
             const addressType = combinedBuffer.readUInt8(0);
             consumedBytes = 1;
 
@@ -59,115 +79,110 @@ const server = net.createServer((workerSocket) => {
             } else if (addressType === 3) { // IPv6
                 if (combinedBuffer.length < consumedBytes + 16 + 2) return; // IPv6 (16) + port (2)
                 const ipv6Bytes = [];
-                for (let i = 0; i < 16; i += 2) {
-                    ipv6Bytes.push(combinedBuffer.readUInt16BE(consumedBytes + i).toString(16));
+                for (let i = 0; i < 8; i++) { // 8 groups of 2 bytes
+                    ipv6Bytes.push(combinedBuffer.readUInt16BE(consumedBytes + i * 2).toString(16));
                 }
                 targetHost = ipv6Bytes.join(':');
                 consumedBytes += 16;
             } else {
-                throw new Error(`Invalid addressType: ${addressType}`);
+                return cleanup(`Invalid addressType: ${addressType}`);
             }
 
             targetPort = combinedBuffer.readUInt16BE(consumedBytes);
             consumedBytes += 2;
             targetInfoReceived = true;
-            clearTimeout(connectTimeout); // Clear timeout once target info is received
-            console.log(`[RELAY] Received target from Worker: ${targetHost}:${targetPort}`);
-
-            // Extract any remaining data that was part of the VLESS payload
+            
+            // 任何在目标信息之后但在同一个数据块中的数据，都属于VLESS的原始负载
             const remainingVlessData = combinedBuffer.slice(consumedBytes);
-            initialDataBuffer = [remainingVlessData]; // Save for sending after connection
+            initialDataBuffer = [remainingVlessData]; // 保存，在连接到目标后发送
 
-            // Now connect to the actual target
+            console.log(`[RELAY] Received target from Worker: ${targetHost}:${targetPort}`);
+            
+            // 连接到真实目标
             upstreamSocket = new net.Socket();
             upstreamSocket.setNoDelay(true);
+            upstreamSocket.setKeepAlive(true, 60000);
 
-            upstreamSocket.connect({ host: targetHost, port: targetPort }, () => {
+
+            upstreamSocket.connect({ host: targetHost, port: targetPort, family: (addressType === 1 ? 4 : (addressType === 3 ? 6 : undefined)) }, () => {
+                if (connectTimer) clearTimeout(connectTimer); // 清除初始连接/握手超时
+                connectTimer = null;
+
                 console.log(`[RELAY] Connected to target: ${targetHost}:${targetPort}`);
-                workerSocket.write(Buffer.from([0])); // Send 0 (success) to Worker
+                try {
+                    workerSocket.write(Buffer.from([0])); // 发送 0 (成功) 给 Worker
+                    handshakeCompleted = true; // 握手成功
+                    console.log(`[RELAY] Sent success status to Worker for ${targetHost}:${targetPort}`);
 
-                // Send any buffered VLESS initial payload
-                if (initialDataBuffer.length > 0) {
-                    const headPayload = Buffer.concat(initialDataBuffer);
-                    if (headPayload.length > 0) {
-                        console.log(`[RELAY] Writing initial ${headPayload.length} bytes of VLESS data to target`);
-                        upstreamSocket.write(headPayload);
+                    // 发送任何已缓冲的VLESS初始负载
+                    if (initialDataBuffer.length > 0) {
+                        const headPayload = Buffer.concat(initialDataBuffer);
+                        if (headPayload.length > 0) {
+                            console.log(`[RELAY] Writing initial ${headPayload.length} bytes of VLESS data to target`);
+                            if (!upstreamSocket.write(headPayload)) {
+                                workerSocket.pause(); // 如果上游缓冲区满，暂停从Worker读取
+                                upstreamSocket.once('drain', () => {
+                                     if (!workerSocket.destroyed) workerSocket.resume();
+                                });
+                            }
+                        }
+                        initialDataBuffer = []; // 清空缓冲区
                     }
-                    initialDataBuffer = []; // Clear buffer
-                }
 
-                // Start piping
-                workerSocket.pipe(upstreamSocket);
-                upstreamSocket.pipe(workerSocket);
+                    // 启动双向管道
+                    workerSocket.pipe(upstreamSocket);
+                    upstreamSocket.pipe(workerSocket);
+
+                } catch (writeErr) {
+                    cleanup(`Error writing success status to worker: ${writeErr.message}`);
+                }
             });
 
             upstreamSocket.on('error', (err) => {
-                console.error(`[RELAY] Upstream connection error to ${targetHost}:${targetPort}: ${err.message}`);
-                if (!workerSocket.destroyed) {
-                    workerSocket.write(Buffer.from([1])); // Send 1 (failure) to Worker
-                    workerSocket.destroy(err);
-                }
-                clearTimeout(connectTimeout);
+                cleanup(`Upstream connection error to ${targetHost}:${targetPort}: ${err.message}`);
             });
 
             upstreamSocket.on('close', () => {
                 console.log(`[RELAY] Upstream connection to ${targetHost}:${targetPort} closed.`);
                 if (!workerSocket.destroyed) workerSocket.destroy();
-                clearTimeout(connectTimeout);
+                if (connectTimer) clearTimeout(connectTimer);
             });
-            upstreamSocket.on('timeout', () => {
-                console.error(`[RELAY] Upstream connection to ${targetHost}:${targetPort} timed out.`);
-                 if (!workerSocket.destroyed) {
-                    workerSocket.write(Buffer.from([1]));
-                    workerSocket.destroy(new Error('Upstream timeout'));
-                }
-                clearTimeout(connectTimeout);
+
+            upstreamSocket.setTimeout(UPSTREAM_TIMEOUT, () => {
+                 cleanup(`Upstream connection to ${targetHost}:${targetPort} timed out after ${UPSTREAM_TIMEOUT}ms`);
             });
-            upstreamSocket.setTimeout(CONNECTION_TIMEOUT);
 
 
         } catch (e) {
-            if (e instanceof RangeError && e.message.includes('Index out of range')) {
-                // Not enough data yet to parse header, wait for more.
-                // initialDataBuffer already contains the partial data.
+            // RangeError通常意味着数据包不完整，等待更多数据
+            if (e instanceof RangeError && e.message && e.message.toLowerCase().includes('out of range')) {
+                // initialDataBuffer 已经包含了部分数据，等待下一次 'data' 事件
                 return;
             }
-            console.error(`[RELAY] Error processing target info or connecting: ${e.message}`);
-            if (!workerSocket.destroyed) {
-                workerSocket.write(Buffer.from([1])); // Send 1 (failure)
-                workerSocket.destroy(e);
-            }
-            clearTimeout(connectTimeout);
+            cleanup(`Error processing target info or connecting: ${e.message}`);
         }
     });
 
     workerSocket.on('error', (err) => {
-        console.error(`[RELAY] Worker socket error: ${err.message}`);
-        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
-        clearTimeout(connectTimeout);
+        cleanup(`Worker socket error: ${err.message}`);
     });
 
     workerSocket.on('close', () => {
-        console.log(`[RELAY] CF Worker connection closed.`);
-        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
-        clearTimeout(connectTimeout);
+        console.log(`[RELAY] CF Worker connection closed by worker.`);
+        cleanup(); // No error message, just clean up
     });
-
-    workerSocket.on('timeout', () => {
-        console.error(`[RELAY] Worker socket timed out before target info processed.`);
-        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
-        workerSocket.destroy(new Error('Worker socket timeout'));
-        clearTimeout(connectTimeout);
+    
+    workerSocket.setTimeout(CONNECTION_TIMEOUT, () => { // 初始超时
+        if (!targetInfoReceived) {
+            cleanup(`Worker socket timed out before target info fully received after ${CONNECTION_TIMEOUT}ms.`);
+        }
     });
-    workerSocket.setTimeout(CONNECTION_TIMEOUT);
-
-
 });
 
 server.on('error', (err) => {
     console.error(`[RELAY] Server error: ${err.message}`);
 });
 
-server.listen(RELAY_LISTEN_PORT, () => {
-    console.log(`[RELAY] Node.js TCP Relay server listening on port ${RELAY_LISTEN_PORT}`);
+server.listen(RELAY_LISTEN_PORT, '0.0.0.0', () => {
+    console.log(`[RELAY] Node.js TCP Relay server listening on 0.0.0.0:${RELAY_LISTEN_PORT}`);
 });
