@@ -1,255 +1,118 @@
-const net = require('net');
-const dgram = require('dgram');
-// const url = require('url'); // URL constructor is global in modern Node.js
+const http = require('http');
+const https = require('https');
+const { URL } = require('url'); // Standard URL parser
 
-// --- 配置 ---
-const LOCAL_TCP_PROXY_PORT = 8100; // Node.js TCP 代理监听的本地端口 (HTTP代理端口)
-// DEFAULT_TARGET_TCP_IP 和 DEFAULT_TARGET_TCP_PORT 不再用于动态确定HTTP目标。
-// 如果需要一个“捕获所有”或真正的默认回退，需要更复杂的逻辑。
-// const DEFAULT_TARGET_TCP_IP = '1.0.0.5'; // 已不再直接用于动态HTTP转发
-// const DEFAULT_TARGET_TCP_PORT = 80;      // 已不再直接用于动态HTTP转发
+const PROXY_PORT = 8100; // 中转服务监听的端口
 
-const LOCAL_UDP_PROXY_PORT = 8100; // Node.js UDP 代理监听的本地端口
-const TARGET_UDP_IP = '1.0.0.5';  // UDP 目标服务器 IP (UDP部分仍需此配置)
-const TARGET_UDP_PORT = 443;      // UDP 目标服务器端口 (UDP部分仍需此配置)
+const server = http.createServer((clientReq, clientRes) => {
+    // clientReq.url 会是像 "/https://target-site.com/path?query=value" 这样的形式
+    // 我们需要去掉第一个斜杠 "/" 来获取真正的目标 URL
+    const targetUrlString = clientReq.url.substring(1);
 
-// --- TCP 代理实现 (支持 HTTPS CONNECT 隧道 和 动态目标 HTTP 请求) ---
-const tcpProxyServer = net.createServer((clientSocket) => {
-    console.log(`[TCP] 客户端已连接: ${clientSocket.remoteAddress}:${clientSocket.remotePort}`);
-    const KEEPALIVE_INTERVAL = 60000; // 60 秒
-    clientSocket.setKeepAlive(true, KEEPALIVE_INTERVAL);
-
-    let upstreamSocket; // 连接到目标服务器的socket
-    let buffer = Buffer.alloc(0); // 用于暂存客户端初始数据
-
-    clientSocket.on('data', (data) => {
-        if (!upstreamSocket) { // 还没有建立到目标服务器的连接，这是初始请求
-            buffer = Buffer.concat([buffer, data]);
-            const requestStr = buffer.toString('utf8');
-
-            const firstLineEnd = requestStr.indexOf('\r\n');
-            if (firstLineEnd === -1) {
-                if (buffer.length > 8192) {
-                    console.error('[TCP] 初始请求头过大或不完整，关闭连接。');
-                    clientSocket.end();
-                    return;
-                }
-                return; // 继续等待数据，直到收到完整的请求行
-            }
-
-            const requestLine = requestStr.substring(0, firstLineEnd);
-            const [method, targetUrlString, httpVersion] = requestLine.split(' ');
-
-            console.log(`[TCP] 收到请求行: ${requestLine}`);
-
-            if (method === 'CONNECT') {
-                const [targetHost, targetPortStr] = targetUrlString.split(':');
-                const targetPort = parseInt(targetPortStr, 10);
-
-                if (!targetHost || isNaN(targetPort)) {
-                    console.error(`[TCP] 无效的 CONNECT 请求目标: ${targetUrlString}`);
-                    clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
-                    return;
-                }
-
-                console.log(`[TCP] CONNECT 请求到: ${targetHost}:${targetPort}`);
-                upstreamSocket = new net.Socket();
-                upstreamSocket.setKeepAlive(true, KEEPALIVE_INTERVAL);
-
-                upstreamSocket.connect(targetPort, targetHost, () => {
-                    console.log(`[TCP] CONNECT: 已连接到目标 ${targetHost}:${targetPort}`);
-                    clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
-                    // 后续数据将通过pipe传输
-                });
-                
-                clientSocket.pipe(upstreamSocket);
-                upstreamSocket.pipe(clientSocket);
-
-                upstreamSocket.on('error', (err) => {
-                    console.error(`[TCP] CONNECT: 连接到目标 ${targetHost}:${targetPort} 错误: ${err.message}`);
-                    if (!clientSocket.destroyed) {
-                        clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
-                    }
-                });
-                upstreamSocket.on('end', () => {
-                    console.log(`[TCP] CONNECT: 与目标 ${targetHost}:${targetPort} 的连接已关闭`);
-                    if (!clientSocket.destroyed) clientSocket.end();
-                });
-                upstreamSocket.on('close', () => {
-                    console.log(`[TCP] CONNECT: 与目标 ${targetHost}:${targetPort} 的套接字已关闭`);
-                    if (!clientSocket.destroyed) clientSocket.destroy();
-                });
-
-            } else { // 处理普通的 HTTP 请求 (非 CONNECT) - 动态确定目标
-                console.log(`[TCP] 非CONNECT请求 (${method})，尝试从URL动态确定目标: ${targetUrlString}`);
-                let parsedTargetUrl;
-                let dynamicHost;
-                let dynamicPort;
-
-                try {
-                    // 客户端向代理发送请求时，应使用绝对URI，例如 GET http://example.com/path HTTP/1.1
-                    if (!targetUrlString.startsWith('http://') && !targetUrlString.startsWith('https://')) {
-                        // 如果不是绝对URL，我们无法确定Host，除非解析Host头部（当前未实现）
-                        // 为了简单起见，我们这里要求绝对URL
-                        throw new Error('非CONNECT请求需要绝对URL (http://... 或 https://...) 来确定目标。');
-                    }
-                    parsedTargetUrl = new URL(targetUrlString);
-                    dynamicHost = parsedTargetUrl.hostname;
-                    dynamicPort = parsedTargetUrl.port || (parsedTargetUrl.protocol === 'https:' ? 443 : 80);
-
-                    if (parsedTargetUrl.protocol !== 'http:') {
-                         // 这个简单的HTTP转发器不应该直接处理目标是HTTPS的请求
-                         // 客户端应该使用CONNECT方法来请求HTTPS资源
-                        console.error(`[TCP] HTTP: 拒绝转发到非HTTP协议的目标: ${targetUrlString}. 请使用CONNECT方法访问HTTPS资源.`);
-                        clientSocket.end(`HTTP/1.1 400 Bad Request\r\n\r\nCannot proxy plain HTTP to ${parsedTargetUrl.protocol} target. Use CONNECT for HTTPS.\r\n\r\n`);
-                        return;
-                    }
-
-                } catch (e) {
-                    console.error(`[TCP] HTTP: 解析目标URL '${targetUrlString}' 失败: ${e.message}`);
-                    clientSocket.end(`HTTP/1.1 400 Bad Request\r\n\r\nInvalid target URL for HTTP request.\r\n\r\n`);
-                    return;
-                }
-
-                console.log(`[TCP] HTTP: 动态目标解析为: ${dynamicHost}:${dynamicPort}`);
-                upstreamSocket = new net.Socket();
-                upstreamSocket.setKeepAlive(true, KEEPALIVE_INTERVAL);
-
-                upstreamSocket.connect(dynamicPort, dynamicHost, () => {
-                    console.log(`[TCP] HTTP: 已连接到动态目标 ${dynamicHost}:${dynamicPort}`);
-                    // 将客户端发送的原始请求（已缓冲）发送到目标服务器
-                    // 注意：更健壮的代理可能会修改请求行（例如，从绝对URI改为相对路径）
-                    // 并正确处理/转发Host头部。这里我们发送原始缓冲区。
-                    upstreamSocket.write(buffer);
-                    clientSocket.pipe(upstreamSocket);
-                    upstreamSocket.pipe(clientSocket);
-                    buffer = null; // 清空已发送的buffer
-                });
-
-                upstreamSocket.on('error', (err) => {
-                    console.error(`[TCP] HTTP: 连接到动态目标 ${dynamicHost}:${dynamicPort} 错误: ${err.message}`);
-                    if (!clientSocket.destroyed) {
-                        clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
-                    }
-                });
-                upstreamSocket.on('end', () => {
-                    console.log(`[TCP] HTTP: 与动态目标 ${dynamicHost}:${dynamicPort} 的连接已关闭`);
-                     if (!clientSocket.destroyed) clientSocket.end();
-                });
-                upstreamSocket.on('close', () => {
-                    console.log(`[TCP] HTTP: 与动态目标 ${dynamicHost}:${dynamicPort} 的套接字已关闭`);
-                    if (!clientSocket.destroyed) clientSocket.destroy();
-                });
-            }
-        } else {
-            // upstreamSocket 已经建立，数据由 pipe 自动处理
-            // 此处无需额外代码
-        }
-    });
-
-    clientSocket.on('error', (err) => {
-        console.error(`[TCP] 客户端 ${clientSocket.remoteAddress}:${clientSocket.remotePort} 连接错误: ${err.message}`);
-        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
-    });
-    clientSocket.on('end', () => {
-        console.log(`[TCP] 客户端 ${clientSocket.remoteAddress}:${clientSocket.remotePort} 连接已关闭`);
-        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.end();
-    });
-    clientSocket.on('close', () => {
-        console.log(`[TCP] 客户端 ${clientSocket.remoteAddress}:${clientSocket.remotePort} 套接字已关闭`);
-        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
-    });
-});
-
-tcpProxyServer.on('error', (err) => {
-    console.error(`[TCP] 代理服务器错误: ${err.message}`);
-});
-
-// --- UDP 代理实现 (保持不变, 仍需固定目标配置) ---
-const udpProxyServer = dgram.createSocket('udp4');
-// ... (UDP代码与上一版本相同，此处省略以减少重复，请从上一版本复制)
-// 为了完整性，我将它包含进来：
-const udpClientMap = new Map();
-const UDP_CLIENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟超时
-
-udpProxyServer.on('error', (err) => {
-    console.error(`[UDP] 代理服务器错误:\n${err.stack}`);
-    udpProxyServer.close();
-});
-udpProxyServer.on('message', (msg, rinfo) => {
-    console.log(`[UDP] 从客户端 ${rinfo.address}:${rinfo.port} 收到消息，长度 ${msg.length}`);
-    const clientKey = `${rinfo.address}:${rinfo.port}`;
-    udpClientMap.set(clientKey, { address: rinfo.address, port: rinfo.port, lastSeen: Date.now() });
-    udpProxyServer.send(msg, 0, msg.length, TARGET_UDP_PORT, TARGET_UDP_IP, (err) => {
-        if (err) {
-            console.error(`[UDP] 转发到 ${TARGET_UDP_IP}:${TARGET_UDP_PORT} 失败:`, err);
-        } else {
-            console.log(`[UDP] 消息已转发到 ${TARGET_UDP_IP}:${TARGET_UDP_PORT}`);
-        }
-    });
-});
-udpProxyServer.on('listening', () => {
-    const address = udpProxyServer.address();
-    console.log(`[UDP] 代理服务器正在监听 ${address.address}:${address.port}`);
-});
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, clientInfo] of udpClientMap.entries()) {
-        if (now - clientInfo.lastSeen > UDP_CLIENT_TIMEOUT_MS) {
-            console.log(`[UDP] 清理过期的客户端映射: ${key}`);
-            udpClientMap.delete(key);
-        }
+    if (!targetUrlString) {
+        console.log('[PROXY] 收到了空的目标 URL');
+        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
+        clientRes.end('Target URL is missing.');
+        return;
     }
-}, 60 * 1000); // 每分钟检查一次
 
-// --- 启动代理服务器 ---
-tcpProxyServer.listen(LOCAL_TCP_PROXY_PORT, () => {
-    console.log(`TCP 代理服务器 (支持CONNECT和动态HTTP目标) 已启动，正在监听端口 ${LOCAL_TCP_PROXY_PORT}`);
-    console.log(`  配置为HTTP代理: localhost:${LOCAL_TCP_PROXY_PORT}`);
-    console.log(`  HTTP请求应使用绝对URL (例如 GET http://example.com/path HTTP/1.1)`);
-});
+    let targetUrl;
+    try {
+        targetUrl = new URL(targetUrlString);
+    } catch (e) {
+        console.error(`[PROXY] 无效的目标 URL: ${targetUrlString}. 错误: ${e.message}`);
+        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
+        clientRes.end(`Invalid target URL: ${targetUrlString}`);
+        return;
+    }
 
-if (TARGET_UDP_IP) { // 仅当配置了UDP目标时才启动UDP代理
-    udpProxyServer.bind(LOCAL_UDP_PROXY_PORT, () => {
-        console.log(`UDP 代理服务器已启动，正在监听端口 ${LOCAL_UDP_PROXY_PORT}`);
-        console.log(`  将 UDP 流量 (发送到localhost:${LOCAL_UDP_PROXY_PORT}) 转发到 ${TARGET_UDP_IP}:${TARGET_UDP_PORT}`);
-    });
-} else {
-    console.log("未配置 TARGET_UDP_IP，UDP 代理未启动。");
-}
+    console.log(`[PROXY] CF Worker 请求: ${clientReq.method} ${clientReq.url}`);
+    console.log(`[PROXY] 转发到 -> ${targetUrl.href}`);
 
-
-console.log("TCP (CONNECT, 动态HTTP) 和 UDP (如果已配置) 代理正在启动...");
-
-// 优雅关闭处理 (保持不变)
-process.on('SIGINT', () => {
-    console.log("\n收到 SIGINT，正在关闭服务器...");
-    let tcpClosed = false;
-    let udpClosed = !TARGET_UDP_IP; // 如果UDP未启动，则视为已关闭
-
-    const tryExit = () => {
-        if (tcpClosed && udpClosed) {
-            process.exit(0);
-        }
+    const options = {
+        method: clientReq.method,
+        headers: { ...clientReq.headers }, // 复制客户端请求的头部
+        hostname: targetUrl.hostname,
+        port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
+        path: `${targetUrl.pathname}${targetUrl.search}`, // 包含查询参数
+        agent: false, // 关键：为每个请求创建新代理，避免keep-alive问题和头部混乱
+        timeout: 30000, // 30秒超时
     };
 
-    tcpProxyServer.close(() => {
-        console.log("TCP 代理服务器已关闭。");
-        tcpClosed = true;
-        tryExit();
+    // 移除一些在 Node.js http.request 中不应该由我们手动设置的头部，
+    // 或者需要特殊处理的头部。Node 会自动处理 'host'。
+    // 'connection' 头部由 Node.js 管理。
+    delete options.headers.host; // Node.js 会根据 targetUrl.hostname 自动设置 Host 头部
+    // delete options.headers.connection; // 让 Node.js 处理 Connection 头部
+
+    const httpModule = targetUrl.protocol === 'https:' ? https : http;
+
+    const proxyReq = httpModule.request(options, (targetRes) => {
+        console.log(`[PROXY] 收到来自 ${targetUrl.href} 的响应: ${targetRes.statusCode}`);
+        // 将目标服务器的头部和状态码写回给原始客户端 (CF Worker)
+        // 注意：某些头部可能需要特殊处理或过滤 (例如与 hop-by-hop 相关的头部)
+        const responseHeaders = { ...targetRes.headers };
+        // 通常不应该转发 hop-by-hop 头部
+        delete responseHeaders['transfer-encoding'];
+        delete responseHeaders['connection'];
+        delete responseHeaders['keep-alive'];
+        delete responseHeaders['proxy-authenticate'];
+        delete responseHeaders['proxy-authorization'];
+        delete responseHeaders['te'];
+        delete responseHeaders['trailers'];
+        delete responseHeaders['upgrade'];
+
+
+        clientRes.writeHead(targetRes.statusCode, responseHeaders);
+        targetRes.pipe(clientRes, { end: true }); // 将目标服务器的响应体 pipe 给原始客户端
     });
 
-    if (TARGET_UDP_IP) {
-        udpProxyServer.close(() => {
-            console.log("UDP 代理服务器已关闭。");
-            udpClosed = true;
-            tryExit();
-        });
+    proxyReq.on('timeout', () => {
+        console.error(`[PROXY] 请求到 ${targetUrl.href} 超时`);
+        proxyReq.destroy(); // 销毁请求
+        if (!clientRes.headersSent) {
+            clientRes.writeHead(504, { 'Content-Type': 'text/plain' });
+        }
+        clientRes.end('Gateway Timeout');
+    });
+
+    proxyReq.on('error', (e) => {
+        console.error(`[PROXY] 转发到 ${targetUrl.href} 出错: ${e.message}`);
+        if (!clientRes.headersSent) { // 确保只发送一次头部
+            clientRes.writeHead(502, { 'Content-Type': 'text/plain' });
+        }
+        clientRes.end(`Bad Gateway: ${e.message}`);
+    });
+
+    // 将原始客户端 (CF Worker) 的请求体 pipe 给目标服务器的请求
+    // 只有在 GET/HEAD 等方法之外才有请求体
+    if (clientReq.method !== 'GET' && clientReq.method !== 'HEAD') {
+        clientReq.pipe(proxyReq, { end: true });
+    } else {
+        proxyReq.end(); // 对于 GET/HEAD 请求，没有请求体，直接结束请求
     }
 
+    // 如果客户端意外断开连接
+    clientReq.on('error', (err) => {
+        console.error(`[PROXY] 客户端请求错误: ${err.message}`);
+        proxyReq.destroy(); // 中断对目标服务器的请求
+    });
+    clientReq.on('close', () => {
+        if (!clientRes.writableEnded) { // 如果响应还没有结束
+            console.log('[PROXY] 客户端连接在响应完成前关闭');
+            proxyReq.destroy(); // 中断对目标服务器的请求
+        }
+    });
 
-    setTimeout(() => {
-        console.error("无法在规定时间内正常关闭服务器，强制退出。");
-        process.exit(1);
-    }, 5000);
+
+});
+
+server.on('clientError', (err, socket) => {
+    console.error(`[PROXY] 客户端连接错误: ${err.message}`);
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
+server.listen(PROXY_PORT, () => {
+    console.log(`[PROXY] 中转服务正在监听端口 ${PROXY_PORT}`);
+    console.log(`[PROXY] CF Worker 使用示例: fetch('http://<中转IP>:${PROXY_PORT}/https://目标网站.com/路径')`);
 });
