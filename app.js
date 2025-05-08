@@ -1,65 +1,67 @@
 const net = require('net');
 const WebSocket = require('ws');
-const crypto = require('crypto');
+// const crypto = require('crypto'); // No longer needed for SHA224 password
 
+// Configuration
 const RELAY_LISTEN_PORT = 8100; // Node.js relay server listening port
 const CONNECTION_TIMEOUT = 15000; // 15 seconds connection timeout (to the final target)
 const UPSTREAM_TIMEOUT = 30000; // 30 seconds upstream data transfer timeout
 
-console.log(`[RELAY] WebSocket Relay Server starting on port ${RELAY_LISTEN_PORT}`);
+// Allowed VLESS UUID(s) - taken from your VLESS link
+// In a real app, load this from a config file or environment variable
+const ALLOWED_UUIDS = ['0058c4cc-82a2-4cd0-92ed-fe8286d261d2'.replace(/-/g, '')]; // Store without hyphens for easier comparison
+
+console.log(`[VLESS-RELAY] WebSocket VLESS Relay Server starting on port ${RELAY_LISTEN_PORT}`);
+console.log(`[VLESS-RELAY] Allowed UUIDs: ${ALLOWED_UUIDS.join(', ')}`);
 
 const wsServer = new WebSocket.Server({ port: RELAY_LISTEN_PORT });
 
 wsServer.on('connection', (workerSocket, request) => {
     const workerAddress = request.socket.remoteAddress;
     const workerPort = request.socket.remotePort;
-    console.log(`[RELAY] CF Worker connected from ${workerAddress}:${workerPort}`);
+    console.log(`[VLESS-RELAY] Client connected from ${workerAddress}:${workerPort}`);
 
     let targetHost = '';
     let targetPort = 0;
-    let targetInfoReceived = false;
     let upstreamSocket = null;
     let connectTimer = null;
-    let handshakeCompleted = false; // Flag to indicate if handshake (target parsed and upstream connected) is done
-    // let sha224Password = null; // Will be extracted by parseTrojanHeader, not strictly needed as a separate var here if only used for logging/passing
+    let handshakeCompleted = false;
+    let headerInfoReceived = false; // To ensure header is processed only once
 
-    const cleanup = (errorMessage) => {
+    const cleanup = (errorMessage, errorCode = 1011) => {
         if (connectTimer) clearTimeout(connectTimer);
-        connectTimer = null; // Ensure timer is nulled after clearing
+        connectTimer = null;
 
         if (workerSocket.readyState === WebSocket.OPEN) {
-            if (errorMessage && !handshakeCompleted) { // Only send error status if handshake hasn't succeeded
+            if (errorMessage && !handshakeCompleted) {
                 try {
-                    workerSocket.send(Buffer.from([1])); // Send failure status as Buffer
-                    console.log(`[RELAY] Sent failure status to Worker for ${workerAddress}:${workerPort} due to: ${errorMessage}`);
+                    // Send failure status (Buffer.from([1])) if handshake didn't complete
+                    workerSocket.send(Buffer.from([1]));
+                    console.log(`[VLESS-RELAY] Sent failure status to client ${workerAddress}:${workerPort} due to: ${errorMessage}`);
                 } catch (e) {
-                    console.error("[RELAY] Error sending failure status:", e.message);
+                    console.error("[VLESS-RELAY] Error sending failure status:", e.message);
                 }
             }
-            workerSocket.close(1011, errorMessage || 'Connection closed'); // Use 1011 for internal server error or a generic message
+            workerSocket.close(errorCode, errorMessage || 'Connection closed');
         }
         if (upstreamSocket && !upstreamSocket.destroyed) {
             upstreamSocket.destroy();
         }
-        upstreamSocket = null; // Ensure socket is nulled after destroying
-        console.log(`[RELAY] Cleaned up connection for ${workerAddress}:${workerPort}. ${errorMessage || ''}`);
+        upstreamSocket = null;
+        console.log(`[VLESS-RELAY] Cleaned up connection for ${workerAddress}:${workerPort}. ${errorMessage || ''}`);
     };
 
     connectTimer = setTimeout(() => {
-        cleanup('Timeout waiting for Trojan header or upstream connection');
+        cleanup('Timeout waiting for VLESS header or upstream connection');
     }, CONNECTION_TIMEOUT);
 
-    // This single message handler will manage both the initial header and subsequent data
     workerSocket.on('message', async (message) => {
         if (!Buffer.isBuffer(message)) {
-             console.warn("[RELAY] Received non-buffer data, ignoring.");
-             // Depending on strictness, you might want to cleanup:
-             // return cleanup("Protocol error: received non-buffer data.");
-             return;
+            console.warn("[VLESS-RELAY] Received non-buffer data, ignoring.");
+            return;
         }
 
         if (handshakeCompleted) {
-            // Target info processed, upstream connected, forward WebSocket payload
             if (upstreamSocket && !upstreamSocket.destroyed && upstreamSocket.writable) {
                 if (!upstreamSocket.write(message)) {
                     workerSocket.pause();
@@ -67,47 +69,55 @@ wsServer.on('connection', (workerSocket, request) => {
                         if (workerSocket.readyState === WebSocket.OPEN) workerSocket.resume();
                     });
                 }
-            } else if (!upstreamSocket || upstreamSocket.destroyed) {
-                console.warn("[RELAY] Upstream socket not available or destroyed when trying to write post-handshake data.");
+            } else {
                 cleanup("Upstream socket unavailable post-handshake.");
             }
             return;
         }
 
-        if (!targetInfoReceived) {
-            targetInfoReceived = true; // Mark that we are processing the first message as header
+        if (!headerInfoReceived) {
+            headerInfoReceived = true;
 
             try {
-                const parsedInfo = await parseTrojanHeader(message);
+                const parsedInfo = parseVlessHeader(message);
                 if (parsedInfo.hasError) {
                     return cleanup(parsedInfo.message);
                 }
+
+                // Authenticate UUID
+                if (!ALLOWED_UUIDS.includes(parsedInfo.uuid)) {
+                    return cleanup(`Invalid or disallowed UUID: ${parsedInfo.uuid}`);
+                }
+                console.log(`[VLESS-RELAY] UUID Authenticated: ${parsedInfo.uuid}`);
+
                 targetHost = parsedInfo.addressRemote;
                 targetPort = parsedInfo.portRemote;
-                // sha224Password = parsedInfo.password; // Available if needed
 
-                console.log(`[RELAY] Parsed target from Worker: ${targetHost}:${targetPort} (Password hash: ${parsedInfo.password.substring(0, 8)}...)`);
+                if (parsedInfo.command !== 0x01) { // TCP command
+                    return cleanup(`Unsupported VLESS command: ${parsedInfo.command}`);
+                }
+
+                console.log(`[VLESS-RELAY] Parsed target from client: ${targetHost}:${targetPort}`);
 
                 upstreamSocket = net.connect({ host: targetHost, port: targetPort }, () => {
-                    if (connectTimer) clearTimeout(connectTimer); // Clear initial connection timeout
+                    if (connectTimer) clearTimeout(connectTimer);
                     connectTimer = null;
-
                     handshakeCompleted = true;
-                    console.log(`[RELAY] Connected to target: ${targetHost}:${targetPort}`);
+                    console.log(`[VLESS-RELAY] Connected to target: ${targetHost}:${targetPort}`);
 
                     try {
                         if (workerSocket.readyState === WebSocket.OPEN) {
-                            workerSocket.send(Buffer.from([0])); // Send success status as Buffer
-                            console.log(`[RELAY] Sent success status to Worker for ${targetHost}:${targetPort}`);
+                            // Send success status (non-standard for VLESS, but kept for potential CF Worker compatibility)
+                            workerSocket.send(Buffer.from([0]));
+                            console.log(`[VLESS-RELAY] Sent success status to client for ${targetHost}:${targetPort}`);
                         } else {
-                           throw new Error("Worker socket closed before sending success status.");
+                           throw new Error("Client socket closed before sending success status.");
                         }
 
-                        // Forward remaining data (if any) from the header message
                         if (parsedInfo.rawClientData && parsedInfo.rawClientData.length > 0) {
                             if (upstreamSocket.writable) {
                                 if (!upstreamSocket.write(parsedInfo.rawClientData)) {
-                                    workerSocket.pause(); // Pause workerSocket if upstream is congested
+                                    workerSocket.pause();
                                     upstreamSocket.once('drain', () => {
                                         if (workerSocket.readyState === WebSocket.OPEN) workerSocket.resume();
                                     });
@@ -125,7 +135,6 @@ wsServer.on('connection', (workerSocket, request) => {
                     if (workerSocket.readyState === WebSocket.OPEN) {
                         workerSocket.send(data, (err) => {
                             if (err) {
-                                console.error(`[RELAY] Error sending data to worker for ${targetHost}:${targetPort}: ${err.message}`);
                                 cleanup(`WS send error: ${err.message}`);
                             }
                         });
@@ -137,8 +146,7 @@ wsServer.on('connection', (workerSocket, request) => {
                 });
 
                 upstreamSocket.on('close', () => {
-                    console.log(`[RELAY] Upstream connection to ${targetHost}:${targetPort} closed.`);
-                    // No need to call cleanup() here as workerSocket.close() will trigger its own 'close' event which calls cleanup.
+                    console.log(`[VLESS-RELAY] Upstream connection to ${targetHost}:${targetPort} closed.`);
                     if (workerSocket.readyState === WebSocket.OPEN) workerSocket.close(1000, "Upstream closed");
                 });
 
@@ -147,153 +155,139 @@ wsServer.on('connection', (workerSocket, request) => {
                 });
 
             } catch (e) {
-                cleanup(`Error processing Trojan header or connecting: ${e.message}`);
+                cleanup(`Error processing VLESS header or connecting: ${e.toString()}`);
             }
         }
     });
 
     workerSocket.on('error', (err) => {
-        cleanup(`Worker WebSocket error: ${err.message}`);
+        cleanup(`Client WebSocket error: ${err.message}`);
     });
 
     workerSocket.on('close', (code, reason) => {
         const reasonText = reason instanceof Buffer ? reason.toString() : reason;
-        console.log(`[RELAY] CF Worker WebSocket connection from ${workerAddress}:${workerPort} closed with code ${code} and reason: ${reasonText}`);
-        clearInterval(pingInterval); // Clear ping interval on close
-        cleanup(); // Ensure full cleanup
+        console.log(`[VLESS-RELAY] Client WebSocket connection from ${workerAddress}:${workerPort} closed with code ${code}, reason: ${reasonText}`);
+        clearInterval(pingInterval);
+        cleanup(null, code); // Pass null to avoid sending error message if already closed cleanly
     });
 
-    // Optional: Ping to keep connection alive and check status
     const pingInterval = setInterval(() => {
         if (workerSocket.readyState === WebSocket.OPEN) {
             workerSocket.ping((err) => {
                 if (err) {
-                    console.warn(`[RELAY] Ping to ${workerAddress}:${workerPort} failed: ${err.message}. Worker might be unresponsive.`);
-                    // Consider cleanup if ping fails consistently, but be cautious as pongs are optional.
+                    console.warn(`[VLESS-RELAY] Ping to ${workerAddress}:${workerPort} failed: ${err.message}.`);
                 }
             });
         } else {
-            clearInterval(pingInterval); // Stop pinging if socket is not open
+            clearInterval(pingInterval);
         }
-    }, 30000); // Ping every 30 seconds
-
-    // Redundant timeout for workerSocket itself as connectTimer already covers the initial phase.
-    // If the worker sends no data at all after connecting, connectTimer handles it.
-    // If it sends something that's not a valid header, parseTrojanHeader or subsequent logic handles it.
-    // workerSocket.setTimeout(CONNECTION_TIMEOUT, () => { ... });
+    }, 30000);
 });
 
 wsServer.on('error', (err) => {
-    console.error(`[RELAY] WebSocket Server error: ${err.message}`);
+    console.error(`[VLESS-RELAY] WebSocket Server error: ${err.message}`);
 });
 
-// This function is not used in the current relay logic but is kept if needed elsewhere.
-// function calculateSHA224(input) {
-//  return crypto.createHash('sha224').update(input).digest('hex');
-// }
-
-async function parseTrojanHeader(buffer) {
-    const CMD_CONNECT = 0x01;
-    // const CMD_UDPASSOCIATE = 0x03; // Example other command
-
-    const ATYP_IPV4 = 0x01;
-    const ATYP_DOMAIN = 0x03;
-    const ATYP_IPV6 = 0x04;
-
+function parseVlessHeader(buffer) {
     let offset = 0;
 
-    // 1. Password (SHA224 Hex String - 56 characters, which means 28 bytes if it were raw bytes, but it's hex)
-    // The Trojan protocol specifies 56 hex characters for the password.
-    if (buffer.byteLength < offset + 56) {
-        return { hasError: true, message: "Invalid data: Trojan header too short for password hash." };
-    }
-    const passwordHex = buffer.toString('utf8', offset, offset + 56); // Assuming password hash is sent as hex string
-    // Validate if it's a hex string
-    if (!/^[0-9a-fA-F]{56}$/.test(passwordHex)) {
-        return { hasError: true, message: "Invalid Trojan password format: not 56 hex characters."}
-    }
-    offset += 56;
-
-    // 2. CRLF
-    if (buffer.byteLength < offset + 2 || buffer[offset] !== 0x0D || buffer[offset + 1] !== 0x0A) {
-        return { hasError: true, message: "Invalid data: Trojan header missing CRLF after password." };
-    }
-    offset += 2;
-
-    // 3. Command (1 byte)
+    // 1. VLESS Version (1 byte)
     if (buffer.byteLength < offset + 1) {
-        return { hasError: true, message: "Invalid data: Trojan header too short for command." };
+        return { hasError: true, message: "VLESS header too short for Version." };
     }
-    const command = buffer[offset];
+    const version = buffer[offset];
+    offset += 1;
+    if (version !== 0x00) {
+        return { hasError: true, message: `Unsupported VLESS version: ${version}` };
+    }
+
+    // 2. UUID (16 bytes)
+    if (buffer.byteLength < offset + 16) {
+        return { hasError: true, message: "VLESS header too short for UUID." };
+    }
+    const uuid = buffer.subarray(offset, offset + 16).toString('hex');
+    offset += 16;
+
+    // 3. Addons Length (1 byte)
+    if (buffer.byteLength < offset + 1) {
+        return { hasError: true, message: "VLESS header too short for Addons Length." };
+    }
+    const addonsLength = buffer[offset];
     offset += 1;
 
-    if (command !== CMD_CONNECT) {
-        // This relay primarily supports CONNECT. For other commands, behavior might need to differ.
-        // For now, we'll proceed to parse address/port but you might want to reject unsupported commands.
-        console.warn(`[RELAY] Received Trojan command ${command}, but only CONNECT (1) is fully processed by this relay logic for address/port extraction.`);
-        // If you must reject: return { hasError: true, message: `Unsupported Trojan command: ${command}` };
+    // 4. Addons Data (skip for this simple relay)
+    if (buffer.byteLength < offset + addonsLength) {
+        return { hasError: true, message: "VLESS header too short for Addons Data." };
     }
+    // const addonsData = buffer.subarray(offset, offset + addonsLength); // If needed
+    offset += addonsLength;
 
-    // 4. Address Type (1 byte)
+    // 5. Command (1 byte)
     if (buffer.byteLength < offset + 1) {
-        return { hasError: true, message: "Invalid data: Trojan header too short for address type." };
+        return { hasError: true, message: "VLESS header too short for Command." };
+    }
+    const command = buffer[offset]; // 0x01: TCP, 0x02: UDP, 0x03: MUX
+    offset += 1;
+
+    // 6. Target Port (2 bytes, Big Endian)
+    if (buffer.byteLength < offset + 2) {
+        return { hasError: true, message: "VLESS header too short for Target Port." };
+    }
+    const portRemote = buffer.readUInt16BE(offset);
+    offset += 2;
+
+    // 7. Address Type (ATYP) (1 byte)
+    if (buffer.byteLength < offset + 1) {
+        return { hasError: true, message: "VLESS header too short for Address Type." };
     }
     const atyp = buffer[offset];
     offset += 1;
 
     let addressRemote = '';
+    const ATYP_IPV4 = 0x01;
+    const ATYP_DOMAIN = 0x02; // Note: VLESS uses 0x02 for domain
+    const ATYP_IPV6 = 0x03; // Note: VLESS uses 0x03 for IPv6
 
-    // 5. Destination Address (variable length)
-    if (atyp === ATYP_IPV4) { // IPv4
+    // 8. Target Address (variable length)
+    if (atyp === ATYP_IPV4) {
         if (buffer.byteLength < offset + 4) {
-            return { hasError: true, message: "Invalid data: Trojan header too short for IPv4 address." };
+            return { hasError: true, message: "VLESS header too short for IPv4 address." };
         }
         addressRemote = `${buffer[offset]}.${buffer[offset+1]}.${buffer[offset+2]}.${buffer[offset+3]}`;
         offset += 4;
-    } else if (atyp === ATYP_DOMAIN) { // Domain name
-        if (buffer.byteLength < offset + 1) { // Length byte
-            return { hasError: true, message: "Invalid data: Trojan header too short for domain length." };
+    } else if (atyp === ATYP_DOMAIN) {
+        if (buffer.byteLength < offset + 1) { // Domain length byte
+            return { hasError: true, message: "VLESS header too short for domain length." };
         }
         const domainLength = buffer[offset];
         offset += 1;
         if (buffer.byteLength < offset + domainLength) {
-            return { hasError: true, message: "Invalid data: Trojan header too short for domain name." };
+            return { hasError: true, message: "VLESS header too short for domain name." };
         }
         addressRemote = buffer.toString('utf8', offset, offset + domainLength);
         offset += domainLength;
-    } else if (atyp === ATYP_IPV6) { // IPv6
+    } else if (atyp === ATYP_IPV6) {
         if (buffer.byteLength < offset + 16) {
-            return { hasError: true, message: "Invalid data: Trojan header too short for IPv6 address." };
+            return { hasError: true, message: "VLESS header too short for IPv6 address." };
         }
         const parts = [];
         for (let i = 0; i < 16; i += 2) {
             parts.push(buffer.readUInt16BE(offset + i).toString(16));
         }
         addressRemote = parts.join(':');
+        // Ensure correct IPv6 formatting (e.g., ::ffff: for IPv4-mapped IPv6 if needed, but net.connect usually handles various forms)
+        // A common way to canonicalize for IPv6 is more complex, but this should work for net.connect
         offset += 16;
     } else {
-        return { hasError: true, message: `Unsupported address type: ${atyp}` };
+        return { hasError: true, message: `Unsupported VLESS address type: ${atyp}` };
     }
 
-    // 6. Destination Port (2 bytes, Big Endian)
-    if (buffer.byteLength < offset + 2) {
-        return { hasError: true, message: "Invalid data: Trojan header too short for port." };
-    }
-    const portRemote = buffer.readUInt16BE(offset);
-    offset += 2;
-
-    // 7. CRLF
-    if (buffer.byteLength < offset + 2 || buffer[offset] !== 0x0D || buffer[offset + 1] !== 0x0A) {
-        return { hasError: true, message: "Invalid data: Trojan header missing CRLF after request." };
-    }
-    offset += 2;
-
-    // 8. Remaining data in the buffer is the initial payload
+    // 9. Remaining data is initial payload
     const rawClientData = buffer.subarray(offset);
 
     return {
         hasError: false,
-        password: passwordHex, // The 56-char hex string of SHA224(password)
+        uuid: uuid,
         command: command,
         addressRemote: addressRemote,
         portRemote: portRemote,
@@ -301,4 +295,4 @@ async function parseTrojanHeader(buffer) {
     };
 }
 
-console.log("[RELAY] Setup complete. Waiting for connections...");
+console.log("[VLESS-RELAY] Setup complete. Waiting for connections...");
