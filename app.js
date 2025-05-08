@@ -1,24 +1,23 @@
 const net = require('net');
 const dgram = require('dgram');
-const url = require('url'); // 用于解析CONNECT请求中的主机和端口
+// const url = require('url'); // URL constructor is global in modern Node.js
 
 // --- 配置 ---
-const LOCAL_TCP_PROXY_PORT = 8100; // Node.js TCP 代理监听的本地端口 (现在是HTTP代理端口)
-// 对于CONNECT隧道，以下两个目标配置主要用于非CONNECT的普通HTTP请求的默认转发目标
-const DEFAULT_TARGET_TCP_IP = '1.0.0.5';  // 默认TCP目标服务器 IP (用于非CONNECT HTTP请求)
-const DEFAULT_TARGET_TCP_PORT = 80;       // 默认TCP目标服务器端口 (建议为80,如果目标是443则需要下面进一步处理)
+const LOCAL_TCP_PROXY_PORT = 8100; // Node.js TCP 代理监听的本地端口 (HTTP代理端口)
+// DEFAULT_TARGET_TCP_IP 和 DEFAULT_TARGET_TCP_PORT 不再用于动态确定HTTP目标。
+// 如果需要一个“捕获所有”或真正的默认回退，需要更复杂的逻辑。
+// const DEFAULT_TARGET_TCP_IP = '1.0.0.5'; // 已不再直接用于动态HTTP转发
+// const DEFAULT_TARGET_TCP_PORT = 80;      // 已不再直接用于动态HTTP转发
 
 const LOCAL_UDP_PROXY_PORT = 8100; // Node.js UDP 代理监听的本地端口
-const TARGET_UDP_IP = '1.0.0.5';  // UDP 目标服务器 IP
-const TARGET_UDP_PORT = 443;      // UDP 目标服务器端口
+const TARGET_UDP_IP = '1.0.0.5';  // UDP 目标服务器 IP (UDP部分仍需此配置)
+const TARGET_UDP_PORT = 443;      // UDP 目标服务器端口 (UDP部分仍需此配置)
 
-// --- TCP 代理实现 (支持 HTTPS CONNECT 隧道) ---
+// --- TCP 代理实现 (支持 HTTPS CONNECT 隧道 和 动态目标 HTTP 请求) ---
 const tcpProxyServer = net.createServer((clientSocket) => {
     console.log(`[TCP] 客户端已连接: ${clientSocket.remoteAddress}:${clientSocket.remotePort}`);
-    let KEEPALIVE_INTERVAL = 60000; // 60 秒
-
+    const KEEPALIVE_INTERVAL = 60000; // 60 秒
     clientSocket.setKeepAlive(true, KEEPALIVE_INTERVAL);
-
 
     let upstreamSocket; // 连接到目标服务器的socket
     let buffer = Buffer.alloc(0); // 用于暂存客户端初始数据
@@ -28,30 +27,27 @@ const tcpProxyServer = net.createServer((clientSocket) => {
             buffer = Buffer.concat([buffer, data]);
             const requestStr = buffer.toString('utf8');
 
-            // 尝试解析 HTTP 请求行 (例如 "CONNECT example.com:443 HTTP/1.1" 或 "GET / HTTP/1.1")
-            const endOfHeaders = requestStr.indexOf('\r\n\r\n');
-            // 我们只需要请求行来判断是否是CONNECT
             const firstLineEnd = requestStr.indexOf('\r\n');
-            if (firstLineEnd === -1) { // 请求头不完整，继续等待
-                if (buffer.length > 8192) { // 防止buffer过大
+            if (firstLineEnd === -1) {
+                if (buffer.length > 8192) {
                     console.error('[TCP] 初始请求头过大或不完整，关闭连接。');
                     clientSocket.end();
                     return;
                 }
-                return;
+                return; // 继续等待数据，直到收到完整的请求行
             }
 
             const requestLine = requestStr.substring(0, firstLineEnd);
-            const [method, targetUrl, httpVersion] = requestLine.split(' ');
+            const [method, targetUrlString, httpVersion] = requestLine.split(' ');
 
             console.log(`[TCP] 收到请求行: ${requestLine}`);
 
             if (method === 'CONNECT') {
-                const [targetHost, targetPortStr] = targetUrl.split(':');
+                const [targetHost, targetPortStr] = targetUrlString.split(':');
                 const targetPort = parseInt(targetPortStr, 10);
 
                 if (!targetHost || isNaN(targetPort)) {
-                    console.error(`[TCP] 无效的 CONNECT 请求目标: ${targetUrl}`);
+                    console.error(`[TCP] 无效的 CONNECT 请求目标: ${targetUrlString}`);
                     clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
                     return;
                 }
@@ -60,102 +56,121 @@ const tcpProxyServer = net.createServer((clientSocket) => {
                 upstreamSocket = new net.Socket();
                 upstreamSocket.setKeepAlive(true, KEEPALIVE_INTERVAL);
 
-
                 upstreamSocket.connect(targetPort, targetHost, () => {
                     console.log(`[TCP] CONNECT: 已连接到目标 ${targetHost}:${targetPort}`);
                     clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
-                    // 如果buffer中除了CONNECT请求头还有其他数据 (通常不会，但以防万一)
-                    // 一般来说，CONNECT 握手后，后续数据才是加密的SSL/TLS流量
-                    // clientSocket.pipe(upstreamSocket) 会处理后续数据
-                    // upstreamSocket.pipe(clientSocket)
+                    // 后续数据将通过pipe传输
                 });
                 
-                // 将CONNECT请求建立后，后续的clientSocket数据直接pipe给upstreamSocket
                 clientSocket.pipe(upstreamSocket);
                 upstreamSocket.pipe(clientSocket);
 
-
                 upstreamSocket.on('error', (err) => {
                     console.error(`[TCP] CONNECT: 连接到目标 ${targetHost}:${targetPort} 错误: ${err.message}`);
-                    clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
+                    if (!clientSocket.destroyed) {
+                        clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
+                    }
                 });
                 upstreamSocket.on('end', () => {
                     console.log(`[TCP] CONNECT: 与目标 ${targetHost}:${targetPort} 的连接已关闭`);
-                    clientSocket.end();
+                    if (!clientSocket.destroyed) clientSocket.end();
                 });
                 upstreamSocket.on('close', () => {
                     console.log(`[TCP] CONNECT: 与目标 ${targetHost}:${targetPort} 的套接字已关闭`);
-                    clientSocket.destroy();
+                    if (!clientSocket.destroyed) clientSocket.destroy();
                 });
 
+            } else { // 处理普通的 HTTP 请求 (非 CONNECT) - 动态确定目标
+                console.log(`[TCP] 非CONNECT请求 (${method})，尝试从URL动态确定目标: ${targetUrlString}`);
+                let parsedTargetUrl;
+                let dynamicHost;
+                let dynamicPort;
 
-            } else {
-                // 处理普通的 HTTP 请求 (非 CONNECT) - 转发到默认目标
-                // 注意：如果 DEFAULT_TARGET_TCP_PORT 是 443 (HTTPS)，这里的简单转发仍然会导致
-                // "plain HTTP request was sent to HTTPS port" 错误。
-                // 要正确处理这种情况，代理需要作为HTTPS客户端连接到默认目标。
-                // 为简单起见，这里我们还是做纯TCP转发。
-                // 一个更完善的实现会检查 DEFAULT_TARGET_TCP_PORT，如果它是443，
-                // 则使用 `https` 模块来请求。
+                try {
+                    // 客户端向代理发送请求时，应使用绝对URI，例如 GET http://example.com/path HTTP/1.1
+                    if (!targetUrlString.startsWith('http://') && !targetUrlString.startsWith('https://')) {
+                        // 如果不是绝对URL，我们无法确定Host，除非解析Host头部（当前未实现）
+                        // 为了简单起见，我们这里要求绝对URL
+                        throw new Error('非CONNECT请求需要绝对URL (http://... 或 https://...) 来确定目标。');
+                    }
+                    parsedTargetUrl = new URL(targetUrlString);
+                    dynamicHost = parsedTargetUrl.hostname;
+                    dynamicPort = parsedTargetUrl.port || (parsedTargetUrl.protocol === 'https:' ? 443 : 80);
 
-                console.log(`[TCP] 非CONNECT请求 (${method})，尝试转发到默认目标: ${DEFAULT_TARGET_TCP_IP}:${DEFAULT_TARGET_TCP_PORT}`);
+                    if (parsedTargetUrl.protocol !== 'http:') {
+                         // 这个简单的HTTP转发器不应该直接处理目标是HTTPS的请求
+                         // 客户端应该使用CONNECT方法来请求HTTPS资源
+                        console.error(`[TCP] HTTP: 拒绝转发到非HTTP协议的目标: ${targetUrlString}. 请使用CONNECT方法访问HTTPS资源.`);
+                        clientSocket.end(`HTTP/1.1 400 Bad Request\r\n\r\nCannot proxy plain HTTP to ${parsedTargetUrl.protocol} target. Use CONNECT for HTTPS.\r\n\r\n`);
+                        return;
+                    }
+
+                } catch (e) {
+                    console.error(`[TCP] HTTP: 解析目标URL '${targetUrlString}' 失败: ${e.message}`);
+                    clientSocket.end(`HTTP/1.1 400 Bad Request\r\n\r\nInvalid target URL for HTTP request.\r\n\r\n`);
+                    return;
+                }
+
+                console.log(`[TCP] HTTP: 动态目标解析为: ${dynamicHost}:${dynamicPort}`);
                 upstreamSocket = new net.Socket();
                 upstreamSocket.setKeepAlive(true, KEEPALIVE_INTERVAL);
 
-                upstreamSocket.connect(DEFAULT_TARGET_TCP_PORT, DEFAULT_TARGET_TCP_IP, () => {
-                    console.log(`[TCP] HTTP: 已连接到默认目标 ${DEFAULT_TARGET_TCP_IP}:${DEFAULT_TARGET_TCP_PORT}`);
-                    upstreamSocket.write(buffer); // 发送已缓冲的初始数据
+                upstreamSocket.connect(dynamicPort, dynamicHost, () => {
+                    console.log(`[TCP] HTTP: 已连接到动态目标 ${dynamicHost}:${dynamicPort}`);
+                    // 将客户端发送的原始请求（已缓冲）发送到目标服务器
+                    // 注意：更健壮的代理可能会修改请求行（例如，从绝对URI改为相对路径）
+                    // 并正确处理/转发Host头部。这里我们发送原始缓冲区。
+                    upstreamSocket.write(buffer);
                     clientSocket.pipe(upstreamSocket);
                     upstreamSocket.pipe(clientSocket);
-                    buffer = null; // 清空buffer
+                    buffer = null; // 清空已发送的buffer
                 });
 
                 upstreamSocket.on('error', (err) => {
-                    console.error(`[TCP] HTTP: 连接到默认目标 ${DEFAULT_TARGET_TCP_IP}:${DEFAULT_TARGET_TCP_PORT} 错误: ${err.message}`);
-                    clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`); // 或者其他合适的错误
+                    console.error(`[TCP] HTTP: 连接到动态目标 ${dynamicHost}:${dynamicPort} 错误: ${err.message}`);
+                    if (!clientSocket.destroyed) {
+                        clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
+                    }
                 });
-                 upstreamSocket.on('end', () => {
-                    console.log(`[TCP] HTTP: 与默认目标 ${DEFAULT_TARGET_TCP_IP}:${DEFAULT_TARGET_TCP_PORT} 的连接已关闭`);
-                    clientSocket.end();
+                upstreamSocket.on('end', () => {
+                    console.log(`[TCP] HTTP: 与动态目标 ${dynamicHost}:${dynamicPort} 的连接已关闭`);
+                     if (!clientSocket.destroyed) clientSocket.end();
                 });
                 upstreamSocket.on('close', () => {
-                    console.log(`[TCP] HTTP: 与默认目标 ${DEFAULT_TARGET_TCP_IP}:${DEFAULT_TARGET_TCP_PORT} 的套接字已关闭`);
-                    clientSocket.destroy();
+                    console.log(`[TCP] HTTP: 与动态目标 ${dynamicHost}:${dynamicPort} 的套接字已关闭`);
+                    if (!clientSocket.destroyed) clientSocket.destroy();
                 });
             }
         } else {
-            // upstreamSocket 已经建立，这部分代码在新的pipe模式下通常不会直接执行
-            // 因为 clientSocket.pipe(upstreamSocket) 会处理数据转发
+            // upstreamSocket 已经建立，数据由 pipe 自动处理
+            // 此处无需额外代码
         }
     });
 
     clientSocket.on('error', (err) => {
         console.error(`[TCP] 客户端 ${clientSocket.remoteAddress}:${clientSocket.remotePort} 连接错误: ${err.message}`);
-        if (upstreamSocket) upstreamSocket.destroy();
+        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
     });
-
     clientSocket.on('end', () => {
         console.log(`[TCP] 客户端 ${clientSocket.remoteAddress}:${clientSocket.remotePort} 连接已关闭`);
-        if (upstreamSocket) upstreamSocket.end();
+        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.end();
     });
     clientSocket.on('close', () => {
         console.log(`[TCP] 客户端 ${clientSocket.remoteAddress}:${clientSocket.remotePort} 套接字已关闭`);
-        if (upstreamSocket && !upstreamSocket.destroyed) {
-             upstreamSocket.destroy();
-        }
+        if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
     });
-
 });
 
 tcpProxyServer.on('error', (err) => {
     console.error(`[TCP] 代理服务器错误: ${err.message}`);
 });
 
-
-// --- UDP 代理实现 (保持不变) ---
+// --- UDP 代理实现 (保持不变, 仍需固定目标配置) ---
 const udpProxyServer = dgram.createSocket('udp4');
+// ... (UDP代码与上一版本相同，此处省略以减少重复，请从上一版本复制)
+// 为了完整性，我将它包含进来：
 const udpClientMap = new Map();
-const UDP_CLIENT_TIMEOUT_MS = 5 * 60 * 1000;
+const UDP_CLIENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟超时
 
 udpProxyServer.on('error', (err) => {
     console.error(`[UDP] 代理服务器错误:\n${err.stack}`);
@@ -185,37 +200,53 @@ setInterval(() => {
             udpClientMap.delete(key);
         }
     }
-}, 60 * 1000);
-
+}, 60 * 1000); // 每分钟检查一次
 
 // --- 启动代理服务器 ---
 tcpProxyServer.listen(LOCAL_TCP_PROXY_PORT, () => {
-    console.log(`TCP 代理服务器 (支持CONNECT) 已启动，正在监听端口 ${LOCAL_TCP_PROXY_PORT}`);
+    console.log(`TCP 代理服务器 (支持CONNECT和动态HTTP目标) 已启动，正在监听端口 ${LOCAL_TCP_PROXY_PORT}`);
     console.log(`  配置为HTTP代理: localhost:${LOCAL_TCP_PROXY_PORT}`);
-    console.log(`  非CONNECT请求将尝试转发到默认目标: ${DEFAULT_TARGET_TCP_IP}:${DEFAULT_TARGET_TCP_PORT}`);
+    console.log(`  HTTP请求应使用绝对URL (例如 GET http://example.com/path HTTP/1.1)`);
 });
 
-udpProxyServer.bind(LOCAL_UDP_PROXY_PORT, () => {
-    console.log(`UDP 代理服务器已启动，正在监听端口 ${LOCAL_UDP_PROXY_PORT}`);
-    console.log(`  将 UDP 流量 (发送到localhost:${LOCAL_UDP_PROXY_PORT}) 转发到 ${TARGET_UDP_IP}:${TARGET_UDP_PORT}`);
-});
+if (TARGET_UDP_IP) { // 仅当配置了UDP目标时才启动UDP代理
+    udpProxyServer.bind(LOCAL_UDP_PROXY_PORT, () => {
+        console.log(`UDP 代理服务器已启动，正在监听端口 ${LOCAL_UDP_PROXY_PORT}`);
+        console.log(`  将 UDP 流量 (发送到localhost:${LOCAL_UDP_PROXY_PORT}) 转发到 ${TARGET_UDP_IP}:${TARGET_UDP_PORT}`);
+    });
+} else {
+    console.log("未配置 TARGET_UDP_IP，UDP 代理未启动。");
+}
 
-console.log("TCP (CONNECT enabled) 和 UDP 代理正在启动...");
+
+console.log("TCP (CONNECT, 动态HTTP) 和 UDP (如果已配置) 代理正在启动...");
 
 // 优雅关闭处理 (保持不变)
 process.on('SIGINT', () => {
     console.log("\n收到 SIGINT，正在关闭服务器...");
+    let tcpClosed = false;
+    let udpClosed = !TARGET_UDP_IP; // 如果UDP未启动，则视为已关闭
+
+    const tryExit = () => {
+        if (tcpClosed && udpClosed) {
+            process.exit(0);
+        }
+    };
+
     tcpProxyServer.close(() => {
         console.log("TCP 代理服务器已关闭。");
+        tcpClosed = true;
+        tryExit();
     });
-    udpProxyServer.close(() => {
-        console.log("UDP 代理服务器已关闭。");
-        // 等待两个服务器都关闭后再退出
-        // 不过，tcpProxyServer.close() 的回调和 udpProxyServer.close() 的回调
-        // 可能需要一个计数器或 Promise.all 来确保两者都完成后再 exit
-        // 为简单起见，这里直接在最后一个关闭的回调中退出
-        process.exit(0);
-    });
+
+    if (TARGET_UDP_IP) {
+        udpProxyServer.close(() => {
+            console.log("UDP 代理服务器已关闭。");
+            udpClosed = true;
+            tryExit();
+        });
+    }
+
 
     setTimeout(() => {
         console.error("无法在规定时间内正常关闭服务器，强制退出。");
